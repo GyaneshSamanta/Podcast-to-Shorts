@@ -1,4 +1,4 @@
-# PRD: PodcastClipper Local (Windows Desktop)
+# PRD: Podcast-to-Shorts (Windows Desktop)
 
 ## 1. Product Objective
 A specialized, local-only Windows utility that automates the transcription of long-form podcasts and the batch-generation of 9:16 vertical "Shorts" based on a user-defined queue of timestamps.
