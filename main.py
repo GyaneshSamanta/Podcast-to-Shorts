@@ -4,10 +4,18 @@ import threading
 import queue
 import time
 import collections
+import tempfile
 import psutil
 import tkinter as tk
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
+from PIL import Image as PILImage, ImageTk
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 try:
     import GPUtil
     HAS_GPU = True
@@ -16,8 +24,10 @@ except ImportError:
 
 from backend.transcribe_util import TranscriptionEngine
 from backend.video_util import VideoEngine
+from backend.audio_util import enhance_audio
+from backend.subtitle_util import generate_ass
 
-# --- Theme ---
+# ── Theme ─────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("green")
 
@@ -28,6 +38,7 @@ C = {
     "border":   "#2A2A2E",
     "accent":   "#8B5CF6",
     "accent_h": "#7C3AED",
+    "glow":     "#7C3AED",
     "green":    "#10B981",
     "green_h":  "#059669",
     "red":      "#EF4444",
@@ -38,11 +49,12 @@ C = {
     "link":     "#A78BFA",
 }
 
-HISTORY_LEN = 30  # data points for the mini graph
+ASPECT_MODES = ["9:16 Crop", "9:16 Fit", "1:1 Square", "16:9 Original"]
+HISTORY_LEN = 30
 
-# ─── Info-Button Tooltip ──────────────────────────────────────────────────────
+
+# ─── Info-Button Tooltip ──────────────────────────────────────────────────
 class InfoButton(ctk.CTkButton):
-    """A small 'ⓘ' button that shows a tooltip on hover and hides on leave."""
     def __init__(self, master, tip_text, **kw):
         super().__init__(
             master, text="ⓘ", width=22, height=22, corner_radius=11,
@@ -76,9 +88,7 @@ class InfoButton(ctk.CTkButton):
             self._tw = None
 
 
-# ─── Section Header Helper ─────────────────────────────────────────────────
 def section_header(parent, title, tip=None):
-    """Creates a styled heading row with optional info button."""
     row = ctk.CTkFrame(parent, fg_color="transparent")
     row.pack(fill="x", padx=20, pady=(18, 4))
     ctk.CTkLabel(
@@ -91,7 +101,23 @@ def section_header(parent, title, tip=None):
     return row
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Toast Notification ───────────────────────────────────────────────────
+class Toast:
+    """Non-blocking corner notification that auto-fades."""
+    @staticmethod
+    def show(parent, message, kind="success", duration=3500):
+        bg = {"success": C["green"], "error": C["red"], "info": C["accent"]}.get(kind, C["card"])
+        frame = ctk.CTkFrame(parent, fg_color=bg, corner_radius=10)
+        frame.place(relx=1.0, rely=1.0, anchor="se", x=-20, y=-20)
+        ctk.CTkLabel(
+            frame, text=message, text_color="#FFFFFF",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            wraplength=300
+        ).pack(padx=16, pady=10)
+        parent.after(duration, frame.destroy)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 class PodcastClipperApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -100,7 +126,7 @@ class PodcastClipperApp(ctk.CTk):
         if os.path.exists(icon_path):
             self.iconbitmap(icon_path)
 
-        self.title("Podcast-to-Shorts")
+        self.title("PodcastClipper Pro")
         self.geometry("1440x820")
         self.minsize(1100, 650)
         self.configure(fg_color=C["bg"])
@@ -112,8 +138,11 @@ class PodcastClipperApp(ctk.CTk):
         self.clip_queue = []
         self.queue_counter = 1
         self.msg_queue = queue.Queue()
+        self.enhance_audio_var = ctk.BooleanVar(value=False)
+        self.burn_captions_var = ctk.BooleanVar(value=False)
+        self._preview_photo = None  # prevent GC
 
-        # Resource history for graphs
+        # Resource history
         self.cpu_hist = collections.deque([0]*HISTORY_LEN, maxlen=HISTORY_LEN)
         self.ram_hist = collections.deque([0]*HISTORY_LEN, maxlen=HISTORY_LEN)
 
@@ -123,22 +152,20 @@ class PodcastClipperApp(ctk.CTk):
         self.monitor_active = True
         threading.Thread(target=self._resource_loop, daemon=True).start()
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     #  UI Construction
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     def _build_ui(self):
         self.grid_rowconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=0)
         self.grid_columnconfigure(0, weight=1)
 
-        # ── Main PanedWindow (resizable) ──
         self.pw = tk.PanedWindow(
             self, orient=tk.HORIZONTAL, sashwidth=6,
             bg=C["border"], bd=0, handlesize=0
         )
         self.pw.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 4))
 
-        # Three pane frames
         self.left_frame  = ctk.CTkFrame(self.pw, fg_color=C["panel"], corner_radius=14)
         self.center_frame = ctk.CTkFrame(self.pw, fg_color=C["panel"], corner_radius=14)
         self.right_frame  = ctk.CTkFrame(self.pw, fg_color=C["panel"], corner_radius=14)
@@ -154,26 +181,37 @@ class PodcastClipperApp(ctk.CTk):
 
     # ── Left Pane ─────────────────────────────────────────────────────────
     def _build_left(self):
-        section_header(self.left_frame, "Transcription",
-                       "Click any timestamp block to add it to the clip queue on the right.")
+        section_header(self.left_frame, "Preview & Transcription",
+                       "Click any segment to add it to the queue. A frame preview appears above.")
+
+        # Video preview canvas
+        self.preview_canvas = tk.Canvas(
+            self.left_frame, height=200, bg="#000000",
+            highlightthickness=0, bd=0
+        )
+        self.preview_canvas.pack(fill="x", padx=12, pady=(8, 4))
+        self.preview_canvas.create_text(
+            10, 100, text="No preview — load a video and click a segment",
+            fill=C["txt3"], anchor="w", font=("Segoe UI", 10)
+        )
+
         ctk.CTkLabel(
-            self.left_frame, text="AI-generated speech segments appear here after transcription.",
-            text_color=C["txt3"], font=ctk.CTkFont(size=11)
-        ).pack(padx=20, anchor="w", pady=(0, 6))
+            self.left_frame, text="Transcript segments:",
+            text_color=C["txt2"], font=ctk.CTkFont(size=11)
+        ).pack(padx=20, anchor="w", pady=(6, 2))
 
         self.transcript_scroll = ctk.CTkScrollableFrame(
             self.left_frame, fg_color="transparent",
             scrollbar_button_color=C["border"],
             scrollbar_button_hover_color=C["accent"]
         )
-        self.transcript_scroll.pack(expand=True, fill="both", padx=8, pady=(4, 10))
+        self.transcript_scroll.pack(expand=True, fill="both", padx=8, pady=(0, 10))
 
     # ── Center Pane ───────────────────────────────────────────────────────
     def _build_center(self):
         section_header(self.center_frame, "Controls",
-                       "Follow steps 1-4 from top to bottom to generate your shorts.")
+                       "Follow steps 1→5 to generate your shorts.")
 
-        # Step 1
         self._step_label(self.center_frame, "STEP 1")
         self.btn_load = ctk.CTkButton(
             self.center_frame, text="Load Source Video",
@@ -186,9 +224,8 @@ class PodcastClipperApp(ctk.CTk):
             self.center_frame, text="No video selected",
             text_color=C["txt3"], font=ctk.CTkFont(size=11)
         )
-        self.lbl_input.pack(pady=(0, 14))
+        self.lbl_input.pack(pady=(0, 10))
 
-        # Step 2
         self._step_label(self.center_frame, "STEP 2")
         self.btn_output = ctk.CTkButton(
             self.center_frame, text="Set Output Folder",
@@ -202,9 +239,8 @@ class PodcastClipperApp(ctk.CTk):
             self.center_frame, text="No directory selected",
             text_color=C["txt3"], font=ctk.CTkFont(size=11)
         )
-        self.lbl_output.pack(pady=(0, 14))
+        self.lbl_output.pack(pady=(0, 10))
 
-        # Step 3
         self._step_label(self.center_frame, "STEP 3")
         self.btn_transcribe = ctk.CTkButton(
             self.center_frame, text="Generate Transcript",
@@ -212,10 +248,40 @@ class PodcastClipperApp(ctk.CTk):
             fg_color="transparent", border_width=2, border_color=C["accent"],
             hover_color=C["card"], command=self._start_transcription
         )
-        self.btn_transcribe.pack(padx=20, fill="x", pady=(0, 14))
+        self.btn_transcribe.pack(padx=20, fill="x", pady=(0, 10))
 
-        # Step 4
-        self._step_label(self.center_frame, "STEP 4")
+        # ── Audio & Captions toggles ──
+        self._step_label(self.center_frame, "STEP 4 — OPTIONS")
+
+        toggle_frame = ctk.CTkFrame(self.center_frame, fg_color=C["card"], corner_radius=10)
+        toggle_frame.pack(padx=20, fill="x", pady=(0, 10))
+
+        r1 = ctk.CTkFrame(toggle_frame, fg_color="transparent")
+        r1.pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(r1, text="🎧 Enhance Audio", text_color=C["txt"],
+                     font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkSwitch(
+            r1, text="", variable=self.enhance_audio_var,
+            width=40, height=20,
+            progress_color=C["accent"], button_color=C["txt"],
+            fg_color=C["border"]
+        ).pack(side="right")
+        InfoButton(r1, "AI noise removal + Podcast Master EQ.\nBoosts warmth & clarity.").pack(side="right", padx=4)
+
+        r2 = ctk.CTkFrame(toggle_frame, fg_color="transparent")
+        r2.pack(fill="x", padx=12, pady=(4, 10))
+        ctk.CTkLabel(r2, text="💬 Burn-In Captions", text_color=C["txt"],
+                     font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkSwitch(
+            r2, text="", variable=self.burn_captions_var,
+            width=40, height=20,
+            progress_color=C["accent"], button_color=C["txt"],
+            fg_color=C["border"]
+        ).pack(side="right")
+        InfoButton(r2, "Overlay transcription subtitles directly on the video.").pack(side="right", padx=4)
+
+        # ── Render button ──
+        self._step_label(self.center_frame, "STEP 5")
         self.btn_render = ctk.CTkButton(
             self.center_frame, text="Batch Render Queue",
             font=ctk.CTkFont(weight="bold"), height=42, corner_radius=8,
@@ -225,16 +291,21 @@ class PodcastClipperApp(ctk.CTk):
         self.btn_render.pack(padx=20, fill="x", pady=(0, 10))
 
         # Progress
+        self.lbl_stage = ctk.CTkLabel(
+            self.center_frame, text="",
+            text_color=C["accent"], font=ctk.CTkFont(size=10, weight="bold")
+        )
+        self.lbl_stage.pack(side="bottom", pady=(0, 2))
         self.progressbar = ctk.CTkProgressBar(
             self.center_frame, progress_color=C["accent"], fg_color=C["card"]
         )
-        self.progressbar.pack(side="bottom", padx=20, fill="x", pady=(0, 14))
+        self.progressbar.pack(side="bottom", padx=20, fill="x", pady=(0, 4))
         self.progressbar.set(0)
         self.lbl_status = ctk.CTkLabel(
             self.center_frame, text="Awaiting input…",
             text_color=C["txt2"], font=ctk.CTkFont(size=11)
         )
-        self.lbl_status.pack(side="bottom", pady=(0, 6))
+        self.lbl_status.pack(side="bottom", pady=(0, 4))
 
     def _step_label(self, parent, text):
         ctk.CTkLabel(
@@ -245,15 +316,14 @@ class PodcastClipperApp(ctk.CTk):
     # ── Right Pane ────────────────────────────────────────────────────────
     def _build_right(self):
         section_header(self.right_frame, "Clip Queue",
-                       "Each clip can have its own framing mode. Use ↑↓ to reorder, or delete clips.")
+                       "Each clip can have its own framing. Use ↑↓ to reorder.")
 
         ctk.CTkLabel(
             self.right_frame,
-            text="Add clips manually below, or click transcript blocks.",
+            text="Add clips manually or click transcript blocks.",
             text_color=C["txt3"], font=ctk.CTkFont(size=11)
         ).pack(padx=20, anchor="w", pady=(0, 8))
 
-        # Manual add row
         add_row = ctk.CTkFrame(self.right_frame, fg_color="transparent")
         add_row.pack(fill="x", padx=14, pady=(0, 6))
         self.entry_start = ctk.CTkEntry(
@@ -287,7 +357,6 @@ class PodcastClipperApp(ctk.CTk):
         ft.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
         ft.grid_propagate(False)
 
-        # Left side – links
         left = ctk.CTkFrame(ft, fg_color="transparent")
         left.pack(side="left", padx=16, pady=8)
         ctk.CTkLabel(left, text="Built with <3 by Gyanesh  •",
@@ -302,25 +371,22 @@ class PodcastClipperApp(ctk.CTk):
             lbl.pack(side="left", padx=5)
             lbl.bind("<Button-1>", lambda e, u=url: webbrowser.open_new(u))
 
-        # Right side – resource text + mini graph
         right = ctk.CTkFrame(ft, fg_color="transparent")
         right.pack(side="right", padx=16, pady=4)
-
         self.lbl_res = ctk.CTkLabel(
-            right, text="CPU 0% • RAM 0 GB • VRAM N/A",
+            right, text="CPU 0%  •  RAM 0 GB  •  VRAM N/A",
             text_color=C["txt3"], font=ctk.CTkFont(size=10, family="Consolas")
         )
         self.lbl_res.pack(anchor="e")
-
         self.canvas_graph = tk.Canvas(
             right, width=180, height=32, bg=C["panel"],
             highlightthickness=0, bd=0
         )
         self.canvas_graph.pack(anchor="e", pady=(2, 0))
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Resource Monitoring
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    #  Resource Monitor
+    # ─────────────────────────────────────────────────────────────────────
     def _resource_loop(self):
         while self.monitor_active:
             try:
@@ -345,34 +411,33 @@ class PodcastClipperApp(ctk.CTk):
         c = self.canvas_graph
         c.delete("all")
         w, h = 180, 32
-        # CPU line (purple)
         pts = list(self.cpu_hist)
         if len(pts) > 1:
             step = w / (len(pts) - 1)
             coords = []
             for i, v in enumerate(pts):
-                coords.append(i * step)
-                coords.append(h - (v / 100) * h)
+                coords.extend([i * step, h - (v / 100) * h])
             c.create_line(coords, fill=C["accent"], width=1.5, smooth=True)
-        # RAM line (green) – normalise to 32 GB max
         pts_r = list(self.ram_hist)
         if len(pts_r) > 1:
             step = w / (len(pts_r) - 1)
             coords = []
             for i, v in enumerate(pts_r):
-                coords.append(i * step)
-                coords.append(h - (min(v, 32) / 32) * h)
+                coords.extend([i * step, h - (min(v, 32) / 32) * h])
             c.create_line(coords, fill=C["green"], width=1.5, smooth=True)
 
     def destroy(self):
         self.monitor_active = False
         super().destroy()
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     #  Message Queue
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     def _log(self, msg):
         self.msg_queue.put({"type": "log", "msg": msg})
+
+    def _set_stage(self, stage_text):
+        self.msg_queue.put({"type": "stage", "msg": stage_text})
 
     def _poll_queue(self):
         try:
@@ -381,14 +446,17 @@ class PodcastClipperApp(ctk.CTk):
                 t = m["type"]
                 if t == "log":
                     self.lbl_status.configure(text=m["msg"])
+                elif t == "stage":
+                    self.lbl_stage.configure(text=m["msg"])
                 elif t == "progress":
                     self.progressbar.set(m["val"])
                 elif t == "transcribe_done":
                     self._populate_transcript()
+                    Toast.show(self, f"✓ {len(self.transcription_data)} segments found", "success")
                 elif t == "render_done":
-                    messagebox.showinfo("Done", "All clips rendered successfully!")
+                    Toast.show(self, "✓ All clips rendered successfully!", "success")
                 elif t == "error":
-                    messagebox.showerror("Error", m["msg"])
+                    Toast.show(self, f"✗ {m['msg']}", "error", 5000)
                 elif t == "res":
                     self.lbl_res.configure(text=m["txt"])
                     self._draw_graph()
@@ -396,20 +464,20 @@ class PodcastClipperApp(ctk.CTk):
             pass
         self.after(100, self._poll_queue)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     #  File I/O
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     def _load_video(self):
         path = filedialog.askopenfilename(
             title="Select Video",
             filetypes=[("Video Files", "*.mp4 *.mkv *.mov")]
         )
         if path:
-            # Normalize to platform path (Whisper needs backslash on Windows)
             self.input_file = os.path.normpath(path)
             name = os.path.basename(self.input_file)
             self.lbl_input.configure(text=name if len(name) <= 35 else f"…{name[-32:]}")
             self._log(f"Loaded: {name}")
+            self._show_preview_frame(0)  # Show first frame
 
     def _set_output_dir(self):
         path = filedialog.askdirectory(title="Select Output Directory")
@@ -419,35 +487,96 @@ class PodcastClipperApp(ctk.CTk):
             self.lbl_output.configure(text=name if len(name) <= 35 else f"…{name[-32:]}")
             self._log("Output folder set.")
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    #  Video Preview (OpenCV)
+    # ─────────────────────────────────────────────────────────────────────
+    def _show_preview_frame(self, time_sec, mode="9:16 Crop"):
+        """Extract a frame and draw crop overlay on the preview canvas."""
+        if not self.input_file or not HAS_CV2:
+            return
+
+        def _extract():
+            try:
+                cap = cv2.VideoCapture(self.input_file)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(time_sec * fps))
+                ret, frame = cap.read()
+                cap.release()
+                if not ret:
+                    return
+
+                src_h, src_w = frame.shape[:2]
+
+                # Scale to preview width
+                canvas_w = self.preview_canvas.winfo_width() or 400
+                scale = canvas_w / src_w
+                disp_w = canvas_w
+                disp_h = int(src_h * scale)
+
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = PILImage.fromarray(frame_rgb).resize((disp_w, disp_h), PILImage.LANCZOS)
+
+                # Draw crop overlay rectangle
+                self._preview_photo = ImageTk.PhotoImage(img)
+
+                def _update():
+                    self.preview_canvas.delete("all")
+                    self.preview_canvas.configure(height=disp_h)
+                    self.preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_photo)
+
+                    # Draw crop rectangle
+                    if "Crop" in mode or "9:16" in mode:
+                        crop_w = int(disp_h * 9 / 16)
+                        x1 = (disp_w - crop_w) // 2
+                        self.preview_canvas.create_rectangle(
+                            x1, 0, x1 + crop_w, disp_h,
+                            outline=C["glow"], width=2, dash=(6, 4)
+                        )
+                    elif "1:1" in mode:
+                        side = min(disp_w, disp_h)
+                        x1 = (disp_w - side) // 2
+                        y1 = (disp_h - side) // 2
+                        self.preview_canvas.create_rectangle(
+                            x1, y1, x1 + side, y1 + side,
+                            outline=C["green"], width=2, dash=(6, 4)
+                        )
+
+                self.after(0, _update)
+            except Exception as exc:
+                print(f"[Preview] {exc}")
+
+        threading.Thread(target=_extract, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────────────────
     #  Transcription
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     def _start_transcription(self):
         if not self.input_file:
-            messagebox.showwarning("Missing File", "Please load a video first.")
+            Toast.show(self, "Load a video first!", "error")
             return
         if not os.path.isfile(self.input_file):
-            messagebox.showerror("File Not Found",
-                                 f"Cannot access:\n{self.input_file}\n\nMake sure the file exists.")
+            Toast.show(self, f"File not found: {self.input_file}", "error")
             return
         self.btn_transcribe.configure(state="disabled")
         self.progressbar.configure(mode="indeterminate")
         self.progressbar.start()
+        self._set_stage("STAGE 1 / 3  —  Transcribing")
         threading.Thread(target=self._worker_transcribe, daemon=True).start()
 
     def _worker_transcribe(self):
         try:
-            self._log("Loading Whisper model (this may take a minute)…")
+            self._log("Loading Whisper model…")
             engine = TranscriptionEngine(model_size="medium")
             self._log("Model loaded. Transcribing audio…")
             segs = engine.transcribe(self.input_file, callback=self._log)
             self.transcription_data = segs
-            self._log(f"Transcription complete — {len(segs)} segments found.")
+            self._log(f"Transcription complete — {len(segs)} segments.")
             self.msg_queue.put({"type": "transcribe_done"})
         except Exception as e:
-            self.msg_queue.put({"type": "error", "msg": f"Transcription failed:\n{e}"})
+            self.msg_queue.put({"type": "error", "msg": f"Transcription failed: {e}"})
             self._log("Transcription failed.")
         finally:
+            self._set_stage("")
             def _reset():
                 self.progressbar.stop()
                 self.progressbar.configure(mode="determinate")
@@ -473,9 +602,9 @@ class PodcastClipperApp(ctk.CTk):
             )
             btn.pack(fill="x", padx=4, pady=6)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     #  Queue Management
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     def _add_clip(self, start, end):
         label = f"Clip {self.queue_counter}"
         self.queue_counter += 1
@@ -484,9 +613,10 @@ class PodcastClipperApp(ctk.CTk):
             "start": round(float(start), 2),
             "end": round(float(end), 2),
             "label": label,
-            "mode": "Crop (Center)"
+            "mode": "9:16 Crop"
         })
         self._refresh_queue()
+        self._show_preview_frame(start, "9:16 Crop")
 
     def _manual_add(self):
         try:
@@ -498,7 +628,7 @@ class PodcastClipperApp(ctk.CTk):
             self.entry_start.delete(0, "end")
             self.entry_end.delete(0, "end")
         except ValueError:
-            messagebox.showwarning("Invalid", "Enter valid Start and End seconds (Start < End).")
+            Toast.show(self, "Enter valid Start < End seconds.", "error")
 
     def _del_clip(self, cid):
         self.clip_queue = [c for c in self.clip_queue if c["id"] != cid]
@@ -524,6 +654,8 @@ class PodcastClipperApp(ctk.CTk):
                         pass
                 else:
                     c[key] = val
+                if key == "mode":
+                    self._show_preview_frame(c["start"], val)
                 break
 
     def _refresh_queue(self):
@@ -538,6 +670,14 @@ class PodcastClipperApp(ctk.CTk):
             border_color=C["border"], border_width=1
         )
         card.pack(fill="x", pady=5, padx=4)
+
+        # ── Glow hover effect ──
+        def _enter(e):
+            card.configure(border_color=C["glow"], border_width=2)
+        def _leave(e):
+            card.configure(border_color=C["border"], border_width=1)
+        card.bind("<Enter>", _enter)
+        card.bind("<Leave>", _leave)
 
         # Row 1 – label + controls
         r1 = ctk.CTkFrame(card, fg_color="transparent")
@@ -561,7 +701,7 @@ class PodcastClipperApp(ctk.CTk):
             command=lambda: self._move_clip(clip["id"], "up")
         ).pack(side="right", padx=2)
 
-        # Row 2 – timestamps + mode
+        # Row 2 – timestamps + aspect mode
         r2 = ctk.CTkFrame(card, fg_color="transparent")
         r2.pack(fill="x", padx=10, pady=(0, 8))
 
@@ -581,9 +721,9 @@ class PodcastClipperApp(ctk.CTk):
         e_e.bind("<FocusOut>", lambda ev: self._set_clip(clip["id"], "end", e_e.get()))
         e_e.pack(side="left", padx=(2, 8))
 
-        mode_var = ctk.StringVar(value=clip.get("mode", "Crop (Center)"))
+        mode_var = ctk.StringVar(value=clip.get("mode", "9:16 Crop"))
         ctk.CTkOptionMenu(
-            r2, values=["Crop (Center)", "Fit (Add Borders)"],
+            r2, values=ASPECT_MODES,
             variable=mode_var, width=130, height=22,
             font=ctk.CTkFont(size=10),
             fg_color="#2A2A2E", button_color="#3A3A3E",
@@ -591,15 +731,15 @@ class PodcastClipperApp(ctk.CTk):
             command=lambda v: self._set_clip(clip["id"], "mode", v)
         ).pack(side="right")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Rendering
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    #  Rendering Pipeline
+    # ─────────────────────────────────────────────────────────────────────
     def _start_rendering(self):
         if not self.input_file or not self.output_dir:
-            messagebox.showwarning("Missing", "Set both video and output folder first.")
+            Toast.show(self, "Set both video and output folder first.", "error")
             return
         if not self.clip_queue:
-            messagebox.showwarning("Empty", "Add at least one clip to the queue.")
+            Toast.show(self, "Add at least one clip to the queue.", "error")
             return
         self.btn_render.configure(state="disabled")
         self.progressbar.set(0)
@@ -610,21 +750,65 @@ class PodcastClipperApp(ctk.CTk):
         try:
             engine = VideoEngine()
             total = len(self.clip_queue)
+
+            # ── Stage 2: Audio Enhancement (if enabled) ──
+            enhanced_wav = None
+            if self.enhance_audio_var.get():
+                self._set_stage("STAGE 2 / 3  —  Enhancing Audio")
+                enhanced_wav = enhance_audio(self.input_file, callback=self._log)
+                if enhanced_wav:
+                    self._log("Audio enhanced successfully.")
+                else:
+                    self._log("Audio enhancement skipped (not available).")
+
+            # ── Stage 3: Rendering ──
+            self._set_stage("STAGE 3 / 3  —  Rendering Clips")
+
             for i, clip in enumerate(self.clip_queue):
                 name = f"{clip['label'].replace(' ', '_')}.mp4"
                 out = os.path.join(self.output_dir, name)
-                mode = clip.get("mode", "Crop (Center)")
+                mode = clip.get("mode", "9:16 Crop")
+
+                # Generate subtitles if enabled
+                sub_path = None
+                if self.burn_captions_var.get() and self.transcription_data:
+                    sub_path = generate_ass(
+                        self.transcription_data,
+                        clip["start"], clip["end"]
+                    )
+
                 self._log(f"Rendering {i+1}/{total}: {name} [{mode}]")
-                engine.process_clip(self.input_file, out, clip["start"], clip["end"], mode=mode)
+
+                engine.process_clip(
+                    self.input_file, out,
+                    clip["start"], clip["end"],
+                    mode=mode,
+                    subtitle_path=sub_path,
+                    enhanced_audio_path=enhanced_wav,
+                    callback=self._log,
+                )
+
+                # Clean up subtitle temp file
+                if sub_path and os.path.exists(sub_path):
+                    try:
+                        os.remove(sub_path)
+                    except OSError:
+                        pass
+
                 self.msg_queue.put({"type": "progress", "val": (i+1)/total})
+
             self._log("All clips rendered.")
             self.msg_queue.put({"type": "render_done"})
+
         except Exception as e:
             self.msg_queue.put({"type": "error", "msg": str(e)})
             self._log("Render failed.")
         finally:
-            self.after(0, lambda: (self.btn_render.configure(state="normal"),
-                                   self.progressbar.set(1.0)))
+            self._set_stage("")
+            self.after(0, lambda: (
+                self.btn_render.configure(state="normal"),
+                self.progressbar.set(1.0)
+            ))
 
 
 if __name__ == "__main__":
