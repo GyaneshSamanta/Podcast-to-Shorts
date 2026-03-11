@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0.."
 echo Setting up virtual environment...
 python -m venv venv
 call venv\Scripts\activate.bat
